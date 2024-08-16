@@ -6,7 +6,8 @@ from splinepy.utils.data import cartesian_product as _cartesian_product
 from splinepy.utils.data import has_scipy as _has_scipy
 
 if _has_scipy:
-    pass
+    from scipy.sparse import dok_matrix as _dok_matrix
+    from scipy.sparse.linalg import spsolve as _spsolve
 
 
 def _get_integral_measure(spline):
@@ -669,3 +670,560 @@ class Transformation:
         self._all_element_measures = _np.prod(
             _cartesian_product(element_lengths), axis=1
         )
+
+
+class FieldIntegrator(_SplinepyBase):
+    __slots__ = (
+        "_helpee",
+        "_solution_field",
+        "_mapper",
+        "_global_rhs",
+        "_global_system_matrix",
+        "_trafo",
+        "_supports",
+        "_ndofs",
+    )
+
+    def __init__(self, geometry, solution_field=None, orders=None):
+        """ """
+        self._helpee = geometry
+        if solution_field is None:
+            self._solution_field = geometry.copy()
+            self._solution_field.control_points = _np.zeros(
+                (geometry.cps.shape[0], 1)
+            )
+        else:
+            self._solution_field = solution_field
+        self._ndofs = int(
+            _np.prod(
+                [
+                    len(kv) - 1 - deg
+                    for deg, kv in zip(
+                        self._solution_field.degrees,
+                        self._solution_field.knot_vectors,
+                    )
+                ]
+            )
+        )
+        self._mapper = self._solution_field.mapper(reference=self._helpee)
+
+        self.reset(orders)
+
+    def reset(self, orders=None):
+        """ """
+        self._trafo = Transformation(
+            self._helpee, self._solution_field, orders
+        )
+        self.precompute_transformation()
+
+        self._supports = None
+        self._global_rhs = None
+        self._global_system_matrix = None
+
+    def precompute_transformation(self):
+        """Computes the quadrature points, jacobians and their determinants
+        of all elements in spline"""
+        self._trafo.compute_all_supports()
+        self._trafo.compute_all_element_jacobian_determinants()
+
+    @property
+    def supports(self):
+        """ """
+        if self._supports is None:
+            self._supports = self._helpee.supports(self._trafo.all_quad_points)
+
+        return self._supports
+
+    def assemble_matrix(self, function, matrixout=None):
+        """Assemble the system matrix for a given function. If system matrix is
+        already assembled, it will add values on top of existing matrix.
+
+        Parameters
+        ------------
+        function: callable
+            Function which defines how to assemble an element matrix
+        matrixout: np.ndarray / scipy.sparse matrix
+            Assembled matrix will be stored there. Default is global system matrix
+        """
+        # Initialize system matrix if not already
+        if self._global_system_matrix is None and matrixout is None:
+            global_size = (self._ndofs, self._ndofs)
+            if _has_scipy:
+                self._global_system_matrix = _dok_matrix(global_size)
+            else:
+                self._global_system_matrix = _np.zeros(global_size)
+
+        # If other matrix is used, check if it compatible
+        if matrixout is not None:
+            if _has_scipy:
+                assert isinstance(
+                    matrixout, _dok_matrix
+                ), "Matrixout must be scipy sparse dok matrix"
+            else:
+                assert isinstance(matrixout, _np.ndarray)
+            assert matrixout.shape == (self._ndofs, self._ndofs)
+
+        system_matrix = (
+            self._global_system_matrix if matrixout is None else matrixout
+        )
+
+        quad_weights = self._trafo.quadrature_weights
+
+        # Element loop
+        for element_jacobian_det, element_support, element_quad_points in zip(
+            self._trafo.all_jacobian_determinants,
+            self._trafo.all_supports,
+            self._trafo.all_quad_points,
+        ):
+            element_matrix = function(
+                mapper=self._mapper,
+                quad_points=element_quad_points,
+                quad_weights=quad_weights,
+                jacobian_det=element_jacobian_det,
+            )
+            matrix_element_support = _cartesian_product(
+                [element_support, element_support]
+            )
+            system_matrix[
+                matrix_element_support[:, 0], matrix_element_support[:, 1]
+            ] += element_matrix
+
+    def assemble_vector(self, function, current_sol=None, vectorout=None):
+        """Assemble the rhs for a given function. If rhs is already assembled,
+        it will add values on top of existing rhs.
+
+        Parameters
+        ------------
+        function: callable
+            Function which defines how to assemble an element vector
+        current_sol: np.ndarray
+            Current solution vector. Needed for nonlinear forms
+        vectorout: np.ndarray
+            Assembled rhs vector will be stored there. Default is global rhs
+        """
+        # Initialize rhs vector
+        if self._global_rhs is None:
+            self._global_rhs = _np.zeros(self._ndofs)
+
+        # Ensure that current solution has right dimensions
+        if current_sol is not None:
+            assert len(current_sol) == self._ndofs
+
+        if vectorout is not None:
+            assert isinstance(vectorout, _np.ndarray)
+            assert len(vectorout) == self._ndofs
+
+        rhs_vector = self._global_rhs if vectorout is None else vectorout
+
+        # Prepare function arguments, which stay the same for all elements
+        function_args = {
+            "mapper": self._mapper,
+            "quad_weights": self._trafo.quadrature_weights,
+        }
+
+        # Element loop
+        for element_jacobian_det, element_support, element_quad_points in zip(
+            self._trafo.all_jacobian_determinants,
+            self._trafo.all_supports,
+            self._trafo.all_quad_points,
+        ):
+            # Assemble element vector
+            function_args["quad_points"] = element_quad_points
+            function_args["jacobian_det"] = element_jacobian_det
+            if current_sol is not None:
+                function_args["current_sol"] = current_sol[element_support]
+            element_vector = function(**function_args)
+
+            # Add element vector to global rhs vector
+            rhs_vector[element_support] += element_vector
+
+    def assemble_matrix_and_vector(
+        self, function, current_sol=None, matrixout=None, vectorout=None
+    ):
+        """Assemble the system matrix and rhs vector for a given function. If system
+        matrix is already assembled, it will add values on top of existing matrix.
+        The same goes for the rhs vector
+
+        Parameters
+        ------------
+        function: callable
+            Function which defines how to assemble an element matrix and vector
+        current_sol: np.ndarray
+            Current solution vector. Needed for nonlinear forms
+        matrixout: np.ndarray / scipy.sparse matrix
+            Assembled matrix will be stored there. Default is global system matrix
+        vectorout: np.ndarray
+            Assembled rhs vector will be stored there. Default is global rhs
+        """
+        # Initialize system matrix if not already
+        if self._global_system_matrix is None and matrixout is None:
+            global_size = (self._ndofs, self._ndofs)
+            if _has_scipy:
+                self._global_system_matrix = _dok_matrix(global_size)
+            else:
+                self._global_system_matrix = _np.zeros(global_size)
+
+        # If other matrix is used, check if it compatible
+        if matrixout is not None:
+            if _has_scipy:
+                assert isinstance(
+                    matrixout, _dok_matrix
+                ), "Matrixout must be scipy sparse dok matrix"
+            else:
+                assert isinstance(matrixout, _np.ndarray)
+            assert matrixout.shape == (self._ndofs, self._ndofs)
+
+        # Set matrix accordingly
+        system_matrix = (
+            self._global_system_matrix if matrixout is None else matrixout
+        )
+
+        # Initialize rhs vector
+        if self._global_rhs is None:
+            self._global_rhs = _np.zeros(self._ndofs)
+
+        # Ensure that current solution has right dimensions
+        if current_sol is not None:
+            assert len(current_sol) == self._ndofs
+
+        if vectorout is not None:
+            assert isinstance(vectorout, _np.ndarray)
+            assert len(vectorout) == self._ndofs
+
+        # Set rhs vector accordingly
+        rhs_vector = self._global_rhs if vectorout is None else vectorout
+
+        # Prepare function arguments, which stay the same for all elements
+        function_args = {
+            "mapper": self._mapper,
+            "quad_weights": self._trafo.quadrature_weights,
+        }
+
+        # Element loop
+        for element_jacobian_det, element_support, element_quad_points in zip(
+            self._trafo.all_jacobian_determinants,
+            self._trafo.all_supports,
+            self._trafo.all_quad_points,
+        ):
+            # Assemble element matrix and vector
+            function_args["quad_points"] = element_quad_points
+            function_args["jacobian_det"] = element_jacobian_det
+            if current_sol is not None:
+                function_args["current_sol"] = current_sol[element_support]
+            element_matrix, element_vector = function(**function_args)
+
+            # Add element vector to global system matrix
+            matrix_element_support = _cartesian_product(
+                [element_support, element_support]
+            )
+            system_matrix[
+                matrix_element_support[:, 0], matrix_element_support[:, 1]
+            ] += element_matrix
+
+            # Add element vector to global rhs vector
+            rhs_vector[element_support] += element_vector
+
+    def L2_projection(self, function):
+        """Perform an L2-projection of a function
+
+        Parameters
+        ----------------
+        function: callable
+            Function to L2-project
+
+        Returns
+        -------------
+        dof_values: np.ndarray
+            L2-projected values for Dofs
+        """
+
+        def dirichlet_lhs_and_rhs(
+            mapper, quad_points, quad_weights, jacobian_det
+        ):
+            # Assemble system matrix
+            bf_values = mapper._field_reference.basis(quad_points)
+            element_matrix = _np.einsum(
+                "qi,qj,q,q->ij",
+                bf_values,
+                bf_values,
+                quad_weights,
+                jacobian_det,
+                optimize=True,
+            )
+
+            # Assemble rhs
+            quad_points_forward = mapper._geometry_reference.evaluate(
+                quad_points
+            )
+            function_values = function(quad_points_forward)
+            element_vector = _np.einsum(
+                "qj,q,q,q->j",
+                bf_values,
+                function_values,
+                quad_weights,
+                jacobian_det,
+                optimize=True,
+            )
+
+            return element_matrix.ravel(), element_vector
+
+        # Initialiye mass matrix and rhs
+        global_size = (self._ndofs, self._ndofs)
+        mass_matrix = (
+            _dok_matrix(global_size) if _has_scipy else _np.zeros(global_size)
+        )
+        rhs_vector = _np.zeros(self._ndofs)
+        # Assemble lhs and rhs
+        self.assemble_matrix_and_vector(
+            dirichlet_lhs_and_rhs, matrixout=mass_matrix, vectorout=rhs_vector
+        )
+
+        # Solve system to get all dofs
+        dof_values = _np.empty(self._ndofs)
+        if _has_scipy:
+            dof_values = _spsolve(mass_matrix.tocsr(), rhs_vector)
+        else:
+            dof_values = _np.linalg.solve(mass_matrix, rhs_vector)
+
+        return dof_values
+
+    def check_if_assembled(self):
+        """
+        Check if system matrix and rhs are already assembled
+        """
+        if self._global_system_matrix is None or self._global_rhs is None:
+            raise ValueError("System is not yet fully assembled")
+
+    def get_boundary_dofs(
+        self,
+        all_boundaries=True,
+        north=False,
+        east=False,
+        south=False,
+        west=False,
+    ):
+        """
+        Get indices of boundary dofs. Assumes that control points are arranged
+        in the following way: first one is the southwest corner, then the first
+        dimension goes from west to east and second dimension goes from south to
+        north.
+
+        Parameters
+        ------------------
+        all_boundaries: bool
+            If True, get indices of all boundary dofs and ignores values for
+            north, south, east and west. On the other, if any boundary is selected,
+            this value will be ignored
+        north: bool
+            If True, return indices for north boundary of geometry
+        east: bool
+        south: bool
+        west: bool
+
+        Returns
+        -------------
+        indices: np.ndarray
+            Indices of relevant boundary dofs
+        """
+        relevant_spline = (
+            self._helpee
+            if self._solution_field is None
+            else self._solution_field
+        )
+
+        multi_index = relevant_spline.multi_index
+
+        multi_indices = [
+            multi_index[0, :],
+            multi_index[-1, :],
+            multi_index[:, 0],
+            multi_index[:, -1],
+        ]
+
+        # If at least one boundary is True, set all_boundaries to False
+        if north or east or south or west:
+            all_boundaries = False
+
+        boundaries = (
+            [True] * 4 if all_boundaries else [west, east, south, north]
+        )
+
+        indices = _np.unique(
+            _np.hstack(
+                [
+                    index
+                    for index, boundary in zip(multi_indices, boundaries)
+                    if boundary
+                ]
+            )
+        )
+
+        return indices
+
+    def apply_homogeneous_dirichlet_boundary_conditions(
+        self,
+        all_boundaries=True,
+        north=False,
+        east=False,
+        south=False,
+        west=False,
+    ):
+        """
+        Assembles homogeneous Dirichlet boundary conditions
+
+        Parameters
+        -------------
+        all_boundaries: bool
+            If True, get indices of all boundary dofs and ignores values for
+            north, south, east and west
+        north: bool
+            If True, sets homogeneous Dirichlet condition on north boundary
+        east: bool
+        south: bool
+        west: bool
+        """
+        self.check_if_assembled()
+
+        indices = self.get_boundary_dofs(
+            all_boundaries, north, east, south, west
+        )
+
+        self._global_system_matrix[indices, :] = 0
+        self._global_system_matrix[indices, indices] = 1
+        self._global_rhs[indices] = 0
+
+    def apply_dirichlet_boundary_conditions(
+        self,
+        function,
+        return_values=False,
+        all_boundaries=True,
+        north=False,
+        east=False,
+        south=False,
+        west=False,
+    ):
+        """
+        Applies Dirichlet boundary conditions via :math:`L^2`-projection.
+
+        For a given function g, :math:`L^2`-projection is obtained by solving
+        the following equation:
+
+        .. math:: \\sum\\limits_{j=1}^n \\alpha_j (N_i, N_j) = (g, N_i) \\quad
+        \forall i = 1, \\dots, n.
+
+        Then, :math:`Pg`, the :math:`L^2`-projection of the function, is
+        given by
+
+        .. math:: Pg(x) = \\sum\\limits_{j=1}^n \\alpha_j \\phi_j(x).
+
+        For the Dirichlet boundary conditions, only the DoFs corresponding to
+        the boundaries are taken from the :math:`L^2`-projection.
+
+        Parameters
+        -------------
+        function: callable
+            Function to apply. Input are points, output is scalar
+        return_values: bool
+            If True, computed values and the corresponding DoF indices will be returned
+            and not applied to global system matrix or the global rhs. If False, values
+            will be applied to system matrix and rhs and nothing will be returned
+        all_boundaries: bool
+            If True, get indices of all boundary dofs and ignores values for
+            north, south, east and west
+        north: bool
+            If True, sets homogeneous Dirichlet condition on north boundary
+        east: bool
+        south: bool
+        west: bool
+        """
+        if not return_values:
+            self.check_if_assembled()
+
+        dof_vector = self.L2_projection(function)
+
+        # Get relevant dofs
+        indices = self.get_boundary_dofs(
+            all_boundaries, north, east, south, west
+        )
+
+        if return_values:
+            return dof_vector[indices], indices
+        else:
+            # Apply Dirichlet to relevant boundary dofs
+            self._global_system_matrix[indices, :] = 0
+            self._global_system_matrix[indices, indices] = 1
+            self._global_rhs[indices] = dof_vector[indices]
+
+    def solve_linear_system(self):
+        """
+        Solve linear system for system matrix and rhs
+        """
+        self.check_if_assembled()
+
+        if _has_scipy:
+            solution_vector = _spsolve(
+                self._global_system_matrix.tocsr(), self._global_rhs
+            )
+        else:
+            solution_vector = _np.linalg.solve(
+                self._global_system_matrix, self._global_rhs
+            )
+        self._solution_field.control_points = solution_vector.reshape(-1, 1)
+
+    def compute_error(self, function, norm="l2"):
+        """
+        Compute error to some given function(s) w.r.t a norm
+
+        Parameters
+        -------------
+        function: callable
+            Analytical function(s) to compare to
+        norm: str
+            Used norm for error calculation
+
+        Returns
+        ------------------
+        error_integration: np.ndarray
+            Value(s) of error in given norm
+        """
+        self._trafo.compute_all_element_jacobian_determinants()
+
+        # Evaluate function and solution values
+        all_quad_points = self._trafo._all_element_quad_points.reshape(
+            -1, self._helpee.para_dim
+        )
+        all_physical_points = self._helpee.evaluate(all_quad_points)
+        all_function_values = function(all_physical_points)
+        solution_values = self._solution_field.evaluate(all_quad_points)
+        error_values = all_function_values - solution_values
+        # Take the norm into consideration
+        if norm == "l1":
+            error_norm_values = _np.abs(error_values)
+        elif norm == "l2":
+            error_norm_values = _np.power(error_values, 2)
+        elif norm == "linf":
+            return _np.max(_np.abs(error_values))
+        else:
+            raise NotImplementedError(f"{norm}-norm not implemented")
+
+        # Integrate error
+        quad_weights = self._trafo._quad_weights
+        n_weights = quad_weights.shape[0]
+        quad_weights = _np.tile(
+            quad_weights, len(solution_values) // len(quad_weights)
+        )
+        self._trafo.compute_all_element_measures()
+
+        error_integration = _np.einsum(
+            "i...,i,i->...",
+            error_norm_values,
+            self._trafo._all_jacobian_determinants.ravel()
+            * _np.repeat(self._trafo._all_element_measures, n_weights),
+            quad_weights,
+            optimize=True,
+        )
+
+        if norm == "l1":
+            return error_integration
+        elif norm == "l2":
+            return _np.sqrt(error_integration)

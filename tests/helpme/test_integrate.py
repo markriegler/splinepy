@@ -191,6 +191,7 @@ def test_function_integration(np_rng):
         bezier.integrate.parametric_function(volume_function),
     )
 
+
 def test_transformation_class(np_rng):
     """Test element transformation of single patch"""
     # Create quadratic spline
